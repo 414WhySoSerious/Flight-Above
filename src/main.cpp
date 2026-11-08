@@ -76,7 +76,11 @@ unsigned long lastPollAt = 0;
 unsigned long lastTimeSyncMessageAt = 0;
 bool firstPoll = true;
 TFT_eSPI display;
-std::vector<String> displayLines;
+struct DisplayLine {
+  String text;
+  uint8_t font;
+};
+std::vector<DisplayLine> displayLines;
 
 void redrawDisplay() {
   if (displayLines.empty()) {
@@ -85,49 +89,65 @@ void redrawDisplay() {
 
   display.fillScreen(TFT_BLACK);
   display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.setTextFont(1);
-  const int lineHeight = display.fontHeight(1);
-  const size_t visibleLines = display.height() / lineHeight;
-  const size_t firstVisibleLine =
-      displayLines.size() > visibleLines ? displayLines.size() - visibleLines : 0;
+  int totalHeight = 0;
+  size_t firstVisibleLine = displayLines.size();
+  while (firstVisibleLine > 0) {
+    const int lineHeight = display.fontHeight(displayLines[firstVisibleLine - 1].font);
+    if (totalHeight + lineHeight > display.height()) {
+      break;
+    }
+    totalHeight += lineHeight;
+    --firstVisibleLine;
+  }
 
   int y = 0;
   for (size_t i = firstVisibleLine; i < displayLines.size(); ++i) {
-    display.drawString(displayLines[i], 0, y, 1);
-    y += lineHeight;
+    display.drawString(displayLines[i].text, 0, y, displayLines[i].font);
+    y += display.fontHeight(displayLines[i].font);
   }
 }
 
-void logLine(const String& message) {
-  Serial.println(message);
-
+void appendDisplayMessage(const String& message, uint8_t font) {
   String currentLine;
   for (size_t i = 0; i < message.length(); ++i) {
     const char character = message[i];
     if (character == '\n') {
-      displayLines.push_back(currentLine);
+      displayLines.push_back({currentLine, font});
       currentLine = "";
       continue;
     }
 
     String candidate = currentLine + character;
     if (!currentLine.isEmpty() &&
-        display.textWidth(candidate, 1) > display.width()) {
-      displayLines.push_back(currentLine);
+        display.textWidth(candidate, font) > display.width()) {
+      displayLines.push_back({currentLine, font});
       currentLine = character;
     } else {
       currentLine = candidate;
     }
   }
   if (!currentLine.isEmpty() || message.isEmpty()) {
-    displayLines.push_back(currentLine);
+    displayLines.push_back({currentLine, font});
   }
 
-  const size_t maxLines = 64;
+  const size_t maxLines = 96;
   if (displayLines.size() > maxLines) {
     displayLines.erase(displayLines.begin(),
                        displayLines.begin() + (displayLines.size() - maxLines));
   }
+}
+
+void logLine(const String& message) {
+  Serial.println(message);
+  appendDisplayMessage(message, 1);
+  redrawDisplay();
+}
+
+void logFlightLine(const String& message) {
+  Serial.println(message);
+  displayLines.push_back({"", 1});
+  appendDisplayMessage(message, 2);
+  displayLines.push_back({"", 1});
   redrawDisplay();
 }
 
@@ -588,13 +608,7 @@ void pollAircraft() {
 
     String description;
     if (describeAircraft(plane, description)) {
-      time_t now = time(nullptr);
-      struct tm localTime;
-      char timestamp[9] = "??:??:??";
-      if (localtime_r(&now, &localTime) != nullptr) {
-        strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &localTime);
-      }
-      logPrintf("%s %s", timestamp, description.c_str());
+      logFlightLine(description);
       announced.push_back(plane.hex);
       ++newlyAnnounced;
     }
@@ -606,7 +620,13 @@ void pollAircraft() {
                        return !containsString(current, hex);
                      }),
       announced.end());
-  logPrintf("Poll complete: %u aircraft returned; %u new airline flights announced.",
+  time_t now = time(nullptr);
+  struct tm localTime;
+  char timestamp[9] = "??:??:??";
+  if (localtime_r(&now, &localTime) != nullptr) {
+    strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &localTime);
+  }
+  logPrintf("%s Poll: %u aircraft, %u new flights.", timestamp,
             static_cast<unsigned>(aircraft.size()),
             static_cast<unsigned>(newlyAnnounced));
 }

@@ -1,10 +1,13 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <ctime>
 #include <vector>
 #include "wifi_credentials.h"
@@ -72,6 +75,70 @@ bool timeWasSynchronized = false;
 unsigned long lastPollAt = 0;
 unsigned long lastTimeSyncMessageAt = 0;
 bool firstPoll = true;
+TFT_eSPI display;
+std::vector<String> displayLines;
+
+void redrawDisplay() {
+  if (displayLines.empty()) {
+    return;
+  }
+
+  display.fillScreen(TFT_BLACK);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.setTextFont(1);
+  const int lineHeight = display.fontHeight(1);
+  const size_t visibleLines = display.height() / lineHeight;
+  const size_t firstVisibleLine =
+      displayLines.size() > visibleLines ? displayLines.size() - visibleLines : 0;
+
+  int y = 0;
+  for (size_t i = firstVisibleLine; i < displayLines.size(); ++i) {
+    display.drawString(displayLines[i], 0, y, 1);
+    y += lineHeight;
+  }
+}
+
+void logLine(const String& message) {
+  Serial.println(message);
+
+  String currentLine;
+  for (size_t i = 0; i < message.length(); ++i) {
+    const char character = message[i];
+    if (character == '\n') {
+      displayLines.push_back(currentLine);
+      currentLine = "";
+      continue;
+    }
+
+    String candidate = currentLine + character;
+    if (!currentLine.isEmpty() &&
+        display.textWidth(candidate, 1) > display.width()) {
+      displayLines.push_back(currentLine);
+      currentLine = character;
+    } else {
+      currentLine = candidate;
+    }
+  }
+  if (!currentLine.isEmpty() || message.isEmpty()) {
+    displayLines.push_back(currentLine);
+  }
+
+  const size_t maxLines = 64;
+  if (displayLines.size() > maxLines) {
+    displayLines.erase(displayLines.begin(),
+                       displayLines.begin() + (displayLines.size() - maxLines));
+  }
+  redrawDisplay();
+}
+
+void logPrintf(const char* format, ...) {
+  char message[384];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(message, sizeof(message), format, args);
+  va_end(args);
+  logLine(message);
+}
 
 bool containsString(const std::vector<String>& values, const String& value) {
   return std::find(values.begin(), values.end(), value) != values.end();
@@ -303,7 +370,7 @@ JsonResult getJson(const String& url, JsonDocument& document,
 
   HTTPClient http;
   if (!http.begin(secureClient, url)) {
-    Serial.printf("  [error] Could not start request: %s\n", url.c_str());
+    logPrintf("  [error] Could not start request: %s", url.c_str());
     return JsonResult::Error;
   }
   http.setConnectTimeout(10000);
@@ -320,7 +387,7 @@ JsonResult getJson(const String& url, JsonDocument& document,
     return JsonResult::NotFound;
   }
   if (status < 0 || status < 200 || status >= 300) {
-    Serial.printf("  [http %d] %s\n", status, url.c_str());
+    logPrintf("  [http %d] %s", status, url.c_str());
     http.end();
     return JsonResult::Error;
   }
@@ -343,8 +410,8 @@ JsonResult getJson(const String& url, JsonDocument& document,
   }
   http.end();
   if (error) {
-    Serial.printf("  [json error] %s: %s (response size: %d bytes)\n",
-                  url.c_str(), error.c_str(), responseSize);
+    logPrintf("  [json error] %s: %s (response size: %d bytes)",
+              url.c_str(), error.c_str(), responseSize);
     return JsonResult::Error;
   }
   return JsonResult::Ok;
@@ -413,8 +480,8 @@ std::vector<Aircraft> getNearbyAircraft() {
     }
 
     provider.blockedUntil = millis() + PROVIDER_COOLDOWN_MS;
-    Serial.printf("  [%s] failed; skipping it for %lu min\n", provider.name,
-                  PROVIDER_COOLDOWN_MS / 60000);
+    logPrintf("  [%s] failed; skipping it for %lu min", provider.name,
+              PROVIDER_COOLDOWN_MS / 60000);
   }
   return {};
 }
@@ -527,7 +594,7 @@ void pollAircraft() {
       if (localtime_r(&now, &localTime) != nullptr) {
         strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &localTime);
       }
-      Serial.printf("%s %s\n", timestamp, description.c_str());
+      logPrintf("%s %s", timestamp, description.c_str());
       announced.push_back(plane.hex);
       ++newlyAnnounced;
     }
@@ -539,9 +606,9 @@ void pollAircraft() {
                        return !containsString(current, hex);
                      }),
       announced.end());
-  Serial.printf("Poll complete: %u aircraft returned; %u new airline flights announced.\n",
-                static_cast<unsigned>(aircraft.size()),
-                static_cast<unsigned>(newlyAnnounced));
+  logPrintf("Poll complete: %u aircraft returned; %u new airline flights announced.",
+            static_cast<unsigned>(aircraft.size()),
+            static_cast<unsigned>(newlyAnnounced));
 }
 
 bool clockIsSynchronized() {
@@ -552,14 +619,18 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
 
   Serial.begin(115200);
-  Serial.println("Flight Above starting");
-  Serial.printf("Watching within %d miles (%d nm) of %.4f, %.4f.\n",
-                SEARCH_RADIUS_MILES, SEARCH_RADIUS_NM, LATITUDE, LONGITUDE);
+  display.init();
+  display.setRotation(1);
+  display.fillScreen(TFT_BLACK);
+
+  logLine("Flight Above starting");
+  logPrintf("Watching within %d miles (%d nm) of %.4f, %.4f.",
+            SEARCH_RADIUS_MILES, SEARCH_RADIUS_NM, LATITUDE, LONGITUDE);
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.println("Connecting to Wi-Fi...");
+  logLine("Connecting to Wi-Fi...");
 }
 
 void loop() {
@@ -567,26 +638,25 @@ void loop() {
   const bool isConnected = WiFi.status() == WL_CONNECTED;
 
   if (isConnected && !wasConnected) {
-    Serial.print("Connected to Wi-Fi. IP address: ");
-    Serial.println(WiFi.localIP());
+    logLine("Connected to Wi-Fi. IP address: " + WiFi.localIP().toString());
     configTzTime(TZ_INFO, "pool.ntp.org", "time.nist.gov");
     timeWasSynchronized = false;
     lastTimeSyncMessageAt = now;
     lastPollAt = now;
     firstPoll = true;
   } else if (!isConnected && wasConnected) {
-    Serial.println("Wi-Fi disconnected.");
+    logLine("Wi-Fi disconnected.");
     timeWasSynchronized = false;
   }
   wasConnected = isConnected;
 
   if (isConnected && !timeWasSynchronized && clockIsSynchronized()) {
-    Serial.println("Clock synchronized; HTTPS certificate checks are ready.");
+    logLine("Clock synchronized; HTTPS certificate checks are ready.");
     timeWasSynchronized = true;
     firstPoll = true;
   } else if (isConnected && !timeWasSynchronized &&
              now - lastTimeSyncMessageAt >= 30000) {
-    Serial.println("Waiting for network time before making verified HTTPS requests.");
+    logLine("Waiting for network time before making verified HTTPS requests.");
     lastTimeSyncMessageAt = now;
   }
 

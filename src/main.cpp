@@ -18,7 +18,7 @@ constexpr float LATITUDE = 43.0389f;
 constexpr float LONGITUDE = -87.9065f;
 constexpr int SEARCH_RADIUS_MILES = 20;
 constexpr int SEARCH_RADIUS_NM = 17;
-constexpr unsigned long POLL_INTERVAL_MS = 10000;
+constexpr unsigned long POLL_INTERVAL_MS = 20000;
 constexpr unsigned long PROVIDER_COOLDOWN_MS = 600000;
 constexpr char USER_AGENT[] = "Mozilla/5.0 (compatible; overhead-flights-prototype/0.1)";
 constexpr char ROUTE_URL[] = "https://api.adsbdb.com/v0/callsign/";
@@ -43,6 +43,13 @@ struct Route {
   String flightNumber;
   String origin;
   String destination;
+};
+
+struct FlightDisplay {
+  String flightNumber;
+  String airline;
+  String route;
+  String aircraftDetails;
 };
 
 struct RouteCacheEntry {
@@ -76,79 +83,90 @@ unsigned long lastPollAt = 0;
 unsigned long lastTimeSyncMessageAt = 0;
 bool firstPoll = true;
 TFT_eSPI display;
-struct DisplayLine {
-  String text;
-  uint8_t font;
-};
-std::vector<DisplayLine> displayLines;
+String pollStatus = "Waiting for Wi-Fi...";
+bool displayInitialized = false;
 
-void redrawDisplay() {
-  if (displayLines.empty()) {
+String fitTextToWidth(const String& text, uint8_t font, int maxWidth) {
+  String result = text;
+  while (!result.isEmpty() && display.textWidth(result, font) > maxWidth) {
+    result.remove(result.length() - 1);
+  }
+  return result;
+}
+
+int drawWrappedText(const String& text, uint8_t font, int y, int bottom) {
+  String line;
+  int lineHeight = display.fontHeight(font);
+  for (size_t i = 0; i < text.length(); ++i) {
+    const char character = text[i];
+    String candidate = line + character;
+    if (!line.isEmpty() && display.textWidth(candidate, font) > display.width() - 8) {
+      if (y + lineHeight > bottom) {
+        return y;
+      }
+      display.drawCentreString(line, display.width() / 2, y, font);
+      y += lineHeight;
+      line = character == ' ' ? "" : String(character);
+    } else {
+      line = candidate;
+    }
+  }
+  if (!line.isEmpty() && y + lineHeight <= bottom) {
+    display.drawCentreString(line, display.width() / 2, y, font);
+    y += lineHeight;
+  }
+  return y;
+}
+
+void drawPollStatus() {
+  if (!displayInitialized) {
     return;
   }
 
-  display.fillScreen(TFT_BLACK);
+  const int statusHeight = display.fontHeight(2) + 4;
+  const int statusY = display.height() - statusHeight;
+  display.fillRect(0, statusY, display.width(), statusHeight, TFT_BLACK);
+  display.drawFastHLine(0, statusY, display.width(), TFT_DARKGREY);
   display.setTextColor(TFT_WHITE, TFT_BLACK);
-  int totalHeight = 0;
-  size_t firstVisibleLine = displayLines.size();
-  while (firstVisibleLine > 0) {
-    const int lineHeight = display.fontHeight(displayLines[firstVisibleLine - 1].font);
-    if (totalHeight + lineHeight > display.height()) {
-      break;
-    }
-    totalHeight += lineHeight;
-    --firstVisibleLine;
-  }
-
-  int y = 0;
-  for (size_t i = firstVisibleLine; i < displayLines.size(); ++i) {
-    display.drawString(displayLines[i].text, 0, y, displayLines[i].font);
-    y += display.fontHeight(displayLines[i].font);
-  }
+  display.drawString(fitTextToWidth(pollStatus, 2, display.width() - 8),
+                     4, statusY + 2, 2);
 }
 
-void appendDisplayMessage(const String& message, uint8_t font) {
-  String currentLine;
-  for (size_t i = 0; i < message.length(); ++i) {
-    const char character = message[i];
-    if (character == '\n') {
-      displayLines.push_back({currentLine, font});
-      currentLine = "";
-      continue;
-    }
+void logLine(const String& message);
 
-    String candidate = currentLine + character;
-    if (!currentLine.isEmpty() &&
-        display.textWidth(candidate, font) > display.width()) {
-      displayLines.push_back({currentLine, font});
-      currentLine = character;
-    } else {
-      currentLine = candidate;
-    }
-  }
-  if (!currentLine.isEmpty() || message.isEmpty()) {
-    displayLines.push_back({currentLine, font});
-  }
+void updatePollStatus(const String& status) {
+  pollStatus = status;
+  logLine(status);
+  drawPollStatus();
+}
 
-  const size_t maxLines = 96;
-  if (displayLines.size() > maxLines) {
-    displayLines.erase(displayLines.begin(),
-                       displayLines.begin() + (displayLines.size() - maxLines));
-  }
+void drawFlight(const FlightDisplay& flight) {
+  display.fillScreen(TFT_BLACK);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  const int statusTop = display.height() - display.fontHeight(2) - 6;
+  const int headlineFont =
+      display.textWidth(flight.flightNumber, 6) <= display.width() - 8 ? 6 : 4;
+  const String headline =
+      fitTextToWidth(flight.flightNumber, headlineFont, display.width() - 8);
+  int y = 4;
+  display.drawCentreString(headline, display.width() / 2, y, headlineFont);
+  y += display.fontHeight(headlineFont) + 3;
+  y = drawWrappedText(flight.airline, 4, y, statusTop);
+  y += 2;
+  y = drawWrappedText(flight.route, 4, y, statusTop);
+  y += 2;
+  drawWrappedText(flight.aircraftDetails, 4, y, statusTop);
+  drawPollStatus();
 }
 
 void logLine(const String& message) {
   Serial.println(message);
-  appendDisplayMessage(message, 1);
-  redrawDisplay();
 }
 
-void logFlightLine(const String& message) {
+void logFlightLine(const String& message, const FlightDisplay& flight) {
   Serial.println(message);
-  displayLines.push_back({"", 1});
-  appendDisplayMessage(message, 2);
-  displayLines.push_back({"", 1});
-  redrawDisplay();
+  drawFlight(flight);
 }
 
 void logPrintf(const char* format, ...) {
@@ -558,7 +576,8 @@ bool lookupRoute(const String& callsign, Route& route) {
   return entry.hasRoute;
 }
 
-bool describeAircraft(Aircraft& aircraft, String& description) {
+bool describeAircraft(Aircraft& aircraft, String& description,
+                      FlightDisplay& flightDisplay) {
   if (!isAirlineCallsign(aircraft.callsign) || aircraft.onGround) {
     return false;
   }
@@ -585,6 +604,18 @@ bool describeAircraft(Aircraft& aircraft, String& description) {
                               ? String(aircraft.distanceNm, 1) + " nm away"
                               : "";
 
+  flightDisplay.flightNumber = flightNumber;
+  flightDisplay.airline = airline;
+  flightDisplay.route = trip;
+  flightDisplay.aircraftDetails = aircraft.planeType;
+  if (!flightDisplay.aircraftDetails.isEmpty()) {
+    flightDisplay.aircraftDetails += " | ";
+  }
+  flightDisplay.aircraftDetails += altitude + " | " + speed;
+  if (!distance.isEmpty()) {
+    flightDisplay.aircraftDetails += " | " + distance;
+  }
+
   description = airline + " " + flightNumber + " | " + trip + " | " +
                 aircraft.planeType + " " + altitude + ", " + speed + ", " + distance;
   return true;
@@ -607,8 +638,9 @@ void pollAircraft() {
     }
 
     String description;
-    if (describeAircraft(plane, description)) {
-      logFlightLine(description);
+    FlightDisplay flightDisplay;
+    if (describeAircraft(plane, description, flightDisplay)) {
+      logFlightLine(description, flightDisplay);
       announced.push_back(plane.hex);
       ++newlyAnnounced;
     }
@@ -626,9 +658,9 @@ void pollAircraft() {
   if (localtime_r(&now, &localTime) != nullptr) {
     strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &localTime);
   }
-  logPrintf("%s Poll: %u aircraft, %u new flights.", timestamp,
-            static_cast<unsigned>(aircraft.size()),
-            static_cast<unsigned>(newlyAnnounced));
+  updatePollStatus(String(timestamp) + " Poll: " +
+                   String(static_cast<unsigned>(aircraft.size())) + " ac +" +
+                   String(static_cast<unsigned>(newlyAnnounced)));
 }
 
 bool clockIsSynchronized() {
@@ -642,6 +674,8 @@ void setup() {
   display.init();
   display.setRotation(1);
   display.fillScreen(TFT_BLACK);
+  displayInitialized = true;
+  drawPollStatus();
 
   logLine("Flight Above starting");
   logPrintf("Watching within %d miles (%d nm) of %.4f, %.4f.",

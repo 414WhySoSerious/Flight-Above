@@ -20,6 +20,7 @@ constexpr int SEARCH_RADIUS_MILES = 20;
 constexpr int SEARCH_RADIUS_NM = 17;
 constexpr float MIN_DISPLAY_ALTITUDE_FEET = 1000.0f;
 constexpr float MIN_DISPLAY_SPEED_KNOTS = 130.0f;
+constexpr float MAX_ROUTE_DETOUR_NM = 150.0f;
 constexpr unsigned long POLL_INTERVAL_MS = 20000;
 constexpr unsigned long PROVIDER_COOLDOWN_MS = 600000;
 constexpr char USER_AGENT[] = "Mozilla/5.0 (compatible; overhead-flights-prototype/0.1)";
@@ -34,10 +35,13 @@ struct Aircraft {
   float altitudeFeet = 0;
   float speedKnots = 0;
   float distanceNm = 999;
+  float latitude = 0;
+  float longitude = 0;
   bool onGround = false;
   bool hasAltitude = false;
   bool hasSpeed = false;
   bool hasDistance = false;
+  bool hasPosition = false;
 };
 
 struct Route {
@@ -45,6 +49,11 @@ struct Route {
   String flightNumber;
   String origin;
   String destination;
+  float originLatitude = 0;
+  float originLongitude = 0;
+  float destinationLatitude = 0;
+  float destinationLongitude = 0;
+  bool hasCoordinates = false;
 };
 
 struct FlightDisplay {
@@ -281,6 +290,8 @@ void addAircraftFilter(JsonDocument& filter, const char* arrayName) {
   filter[arrayName][0]["alt_baro"] = true;
   filter[arrayName][0]["gs"] = true;
   filter[arrayName][0]["dst"] = true;
+  filter[arrayName][0]["lat"] = true;
+  filter[arrayName][0]["lon"] = true;
 }
 
 class HttpBodyStream : public Stream {
@@ -542,6 +553,14 @@ std::vector<Aircraft> getNearbyAircraft() {
           plane.distanceNm = item["dst"].as<float>();
           plane.hasDistance = true;
         }
+        if (item["lat"].is<float>() && item["lon"].is<float>()) {
+          plane.latitude = item["lat"].as<float>();
+          plane.longitude = item["lon"].as<float>();
+          plane.hasPosition = std::isfinite(plane.latitude) &&
+                              std::isfinite(plane.longitude) &&
+                              plane.latitude >= -90 && plane.latitude <= 90 &&
+                              plane.longitude >= -180 && plane.longitude <= 180;
+        }
         aircraft.push_back(plane);
       }
       return aircraft;
@@ -573,6 +592,39 @@ String formatAirport(JsonVariantConst airport) {
   return code.isEmpty() ? city : city + " (" + code + ")";
 }
 
+double distanceNm(float latitude1, float longitude1, float latitude2,
+                  float longitude2) {
+  constexpr double EARTH_RADIUS_NM = 3440.065;
+  constexpr double DEGREES_TO_RADIANS = 0.017453292519943295;
+  const double lat1 = latitude1 * DEGREES_TO_RADIANS;
+  const double lat2 = latitude2 * DEGREES_TO_RADIANS;
+  const double deltaLat = (latitude2 - latitude1) * DEGREES_TO_RADIANS;
+  const double deltaLon = (longitude2 - longitude1) * DEGREES_TO_RADIANS;
+  const double sinHalfLat = sin(deltaLat / 2);
+  const double sinHalfLon = sin(deltaLon / 2);
+  const double rawHaversine = sinHalfLat * sinHalfLat +
+                              cos(lat1) * cos(lat2) * sinHalfLon * sinHalfLon;
+  const double haversine = rawHaversine > 1.0 ? 1.0 : rawHaversine;
+  return EARTH_RADIUS_NM *
+         2 * atan2(sqrt(haversine), sqrt(1 - haversine));
+}
+
+bool routeMatchesPosition(const Aircraft& aircraft, const Route& route) {
+  if (!aircraft.hasPosition || !route.hasCoordinates) {
+    return false;
+  }
+
+  const double directDistance =
+      distanceNm(route.originLatitude, route.originLongitude,
+                 route.destinationLatitude, route.destinationLongitude);
+  const double viaAircraft =
+      distanceNm(route.originLatitude, route.originLongitude,
+                 aircraft.latitude, aircraft.longitude) +
+      distanceNm(aircraft.latitude, aircraft.longitude,
+                 route.destinationLatitude, route.destinationLongitude);
+  return viaAircraft - directDistance <= MAX_ROUTE_DETOUR_NM;
+}
+
 bool lookupRoute(const String& callsign, Route& route) {
   for (const RouteCacheEntry& entry : routeCache) {
     if (entry.callsign == callsign) {
@@ -599,6 +651,28 @@ bool lookupRoute(const String& callsign, Route& route) {
     entry.route.flightNumber = flightRoute["callsign_iata"] | "";
     entry.route.origin = formatAirport(flightRoute["origin"]);
     entry.route.destination = formatAirport(flightRoute["destination"]);
+    JsonVariantConst origin = flightRoute["origin"];
+    JsonVariantConst destination = flightRoute["destination"];
+    if (origin["latitude"].is<float>() && origin["longitude"].is<float>() &&
+        destination["latitude"].is<float>() &&
+        destination["longitude"].is<float>()) {
+      entry.route.originLatitude = origin["latitude"].as<float>();
+      entry.route.originLongitude = origin["longitude"].as<float>();
+      entry.route.destinationLatitude = destination["latitude"].as<float>();
+      entry.route.destinationLongitude = destination["longitude"].as<float>();
+      entry.route.hasCoordinates =
+          std::isfinite(entry.route.originLatitude) &&
+          std::isfinite(entry.route.originLongitude) &&
+          std::isfinite(entry.route.destinationLatitude) &&
+          std::isfinite(entry.route.destinationLongitude) &&
+          entry.route.originLatitude >= -90 && entry.route.originLatitude <= 90 &&
+          entry.route.destinationLatitude >= -90 &&
+          entry.route.destinationLatitude <= 90 &&
+          entry.route.originLongitude >= -180 &&
+          entry.route.originLongitude <= 180 &&
+          entry.route.destinationLongitude >= -180 &&
+          entry.route.destinationLongitude <= 180;
+    }
     entry.hasRoute = true;
     route = entry.route;
   }
@@ -617,7 +691,8 @@ bool describeAircraft(Aircraft& aircraft, String& description,
   }
 
   Route route;
-  const bool hasRoute = lookupRoute(aircraft.callsign, route);
+  const bool routeFound = lookupRoute(aircraft.callsign, route);
+  const bool hasRoute = routeFound && routeMatchesPosition(aircraft, route);
   const String code = aircraft.callsign.substring(0, 3);
   const char* fallbackName = airlineName(code);
   const String airline = hasRoute && !route.airline.isEmpty()
@@ -627,7 +702,7 @@ bool describeAircraft(Aircraft& aircraft, String& description,
       hasRoute && !route.flightNumber.isEmpty() ? route.flightNumber : aircraft.callsign;
   const String trip = hasRoute
                           ? route.origin + " -> " + route.destination
-                          : "route unknown";
+                          : (routeFound ? "route unverified" : "route unknown");
   const String altitude = aircraft.hasAltitude && aircraft.altitudeFeet != 0
                               ? String(static_cast<long>(aircraft.altitudeFeet)) + " ft"
                               : "alt ?";

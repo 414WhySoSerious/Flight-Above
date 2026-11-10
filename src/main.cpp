@@ -18,6 +18,8 @@ constexpr float LATITUDE = 43.0389f;
 constexpr float LONGITUDE = -87.9065f;
 constexpr int SEARCH_RADIUS_MILES = 20;
 constexpr int SEARCH_RADIUS_NM = 17;
+constexpr float MIN_DISPLAY_ALTITUDE_FEET = 1000.0f;
+constexpr float MIN_DISPLAY_SPEED_KNOTS = 130.0f;
 constexpr unsigned long POLL_INTERVAL_MS = 20000;
 constexpr unsigned long PROVIDER_COOLDOWN_MS = 600000;
 constexpr char USER_AGENT[] = "Mozilla/5.0 (compatible; overhead-flights-prototype/0.1)";
@@ -606,7 +608,11 @@ bool lookupRoute(const String& callsign, Route& route) {
 
 bool describeAircraft(Aircraft& aircraft, String& description,
                       FlightDisplay& flightDisplay) {
-  if (!isAirlineCallsign(aircraft.callsign) || aircraft.onGround) {
+  if (!isAirlineCallsign(aircraft.callsign) || aircraft.onGround ||
+      !aircraft.hasAltitude || !std::isfinite(aircraft.altitudeFeet) ||
+      aircraft.altitudeFeet <= MIN_DISPLAY_ALTITUDE_FEET ||
+      !aircraft.hasSpeed || !std::isfinite(aircraft.speedKnots) ||
+      aircraft.speedKnots < MIN_DISPLAY_SPEED_KNOTS) {
     return false;
   }
 

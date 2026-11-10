@@ -96,21 +96,45 @@ String fitTextToWidth(const String& text, uint8_t font, int maxWidth) {
 
 int drawWrappedText(const String& text, uint8_t font, int y, int bottom) {
   String line;
-  int lineHeight = display.fontHeight(font);
-  for (size_t i = 0; i < text.length(); ++i) {
-    const char character = text[i];
-    String candidate = line + character;
-    if (!line.isEmpty() && display.textWidth(candidate, font) > display.width() - 8) {
+  String word;
+  const int lineHeight = display.fontHeight(font);
+  const int maxWidth = display.width() - 8;
+
+  for (size_t i = 0; i <= text.length(); ++i) {
+    const char character = i < text.length() ? text[i] : ' ';
+    if (character != ' ' && character != '\n') {
+      word += character;
+      continue;
+    }
+
+    if (!word.isEmpty()) {
+      if (display.textWidth(word, font) > maxWidth) {
+        word = fitTextToWidth(word, font, maxWidth);
+      }
+      const String candidate = line.isEmpty() ? word : line + " " + word;
+      if (!line.isEmpty() && display.textWidth(candidate, font) > maxWidth) {
+        if (y + lineHeight > bottom) {
+          return y;
+        }
+        display.drawCentreString(line, display.width() / 2, y, font);
+        y += lineHeight;
+        line = word;
+      } else {
+        line = candidate;
+      }
+      word = "";
+    }
+
+    if (character == '\n' && !line.isEmpty()) {
       if (y + lineHeight > bottom) {
         return y;
       }
       display.drawCentreString(line, display.width() / 2, y, font);
       y += lineHeight;
-      line = character == ' ' ? "" : String(character);
-    } else {
-      line = candidate;
+      line = "";
     }
   }
+
   if (!line.isEmpty() && y + lineHeight <= bottom) {
     display.drawCentreString(line, display.width() / 2, y, font);
     y += lineHeight;
@@ -145,10 +169,14 @@ void drawFlight(const FlightDisplay& flight) {
   display.setTextColor(TFT_WHITE, TFT_BLACK);
 
   const int statusTop = display.height() - display.fontHeight(2) - 6;
-  const int headlineFont =
-      display.textWidth(flight.flightNumber, 6) <= display.width() - 8 ? 6 : 4;
-  const String headline =
-      fitTextToWidth(flight.flightNumber, headlineFont, display.width() - 8);
+  uint8_t headlineFont = 6;
+  for (const uint8_t candidateFont : {6, 4, 2, 1}) {
+    if (display.textWidth(flight.flightNumber, candidateFont) <= display.width() - 8) {
+      headlineFont = candidateFont;
+      break;
+    }
+  }
+  const String& headline = flight.flightNumber;
   int y = 4;
   display.drawCentreString(headline, display.width() / 2, y, headlineFont);
   y += display.fontHeight(headlineFont) + 3;
@@ -604,7 +632,7 @@ bool describeAircraft(Aircraft& aircraft, String& description,
                               ? String(aircraft.distanceNm, 1) + " nm away"
                               : "";
 
-  flightDisplay.flightNumber = flightNumber;
+  flightDisplay.flightNumber = aircraft.callsign;
   flightDisplay.airline = airline;
   flightDisplay.route = trip;
   flightDisplay.aircraftDetails = aircraft.planeType;
